@@ -38,10 +38,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
-COPY crates/robot-kit/ crates/robot-kit/
+# Path crate needed for manifest resolution (root package depends on aardvark-sys).
+COPY crates/aardvark-sys crates/aardvark-sys
+# Keep only the root crate in the workspace (path crates are excluded by .dockerignore).
+RUN sed -i 's/^members = \[.*\]/members = ["."]/' Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
@@ -51,7 +51,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi
@@ -61,12 +61,16 @@ RUN rm -rf src benches
 COPY src/ src/
 COPY benches/ benches/
 COPY --from=web-builder /web/dist web/dist
-RUN touch src/main.rs
+COPY *.rs .
+RUN touch src/main.rs src/lib.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    rm -rf target/release/.fingerprint/zeroclawlabs-* \
+           target/release/deps/zeroclawlabs-* \
+           target/release/incremental/zeroclawlabs-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --release --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
       cargo build --release --locked; \
     fi && \

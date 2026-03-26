@@ -29,9 +29,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use tokio::select;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
@@ -83,6 +85,46 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Workspace root; incoming images are saved under `{workspace_dir}/whatsapp_web_incoming/`.
+    workspace_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(feature = "whatsapp-web")]
+static WHATSAPP_WEB_OUTBOUND: OnceLock<Mutex<HashMap<String, Arc<WhatsAppWebChannel>>>> =
+    OnceLock::new();
+
+/// Clear outbound registry (gateway `/external-webhook` shares the listener's connected client).
+#[cfg(feature = "whatsapp-web")]
+pub fn clear_whatsapp_web_outbound_registry() {
+    if let Some(m) = WHATSAPP_WEB_OUTBOUND.get() {
+        m.lock().clear();
+    }
+}
+
+/// Register the same `Arc` used by the channel listener so outbound sends share the connected client.
+#[cfg(feature = "whatsapp-web")]
+pub fn register_whatsapp_web_for_outbound(
+    session_path_expanded: String,
+    ch: Arc<WhatsAppWebChannel>,
+) {
+    let map = WHATSAPP_WEB_OUTBOUND.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock().insert(session_path_expanded, ch);
+}
+
+/// Resolve the live WhatsApp Web channel for this config (same process as `channel start` / `daemon`).
+#[cfg(feature = "whatsapp-web")]
+pub fn outbound_whatsapp_web_for_config(
+    config: &crate::config::Config,
+) -> Option<Arc<WhatsAppWebChannel>> {
+    let wa = config.channels_config.whatsapp.as_ref()?;
+    let sp = wa.session_path.as_ref()?;
+    if !wa.is_web_config() {
+        return None;
+    }
+    let key = shellexpand::tilde(sp).to_string();
+    WHATSAPP_WEB_OUTBOUND
+        .get()
+        .and_then(|m| m.lock().get(&key).cloned())
 }
 
 impl WhatsAppWebChannel {
@@ -125,6 +167,7 @@ impl WhatsAppWebChannel {
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            workspace_dir: None,
         }
     }
 
@@ -143,6 +186,13 @@ impl WhatsAppWebChannel {
         if config.enabled {
             self.tts_config = Some(config);
         }
+        self
+    }
+
+    /// Configure workspace directory for saving downloaded images.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -397,6 +447,221 @@ impl WhatsAppWebChannel {
         }
     }
 
+    const MAX_INCOMING_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn try_save_incoming_image(
+        client: &wa_rs::Client,
+        image: &wa_rs_proto::whatsapp::message::ImageMessage,
+        workspace_dir: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(len) = image.file_length {
+            if len > Self::MAX_INCOMING_IMAGE_BYTES {
+                tracing::info!(
+                    "WhatsApp Web: skipping image ({} bytes exceeds {} MB limit)",
+                    len,
+                    Self::MAX_INCOMING_IMAGE_BYTES / (1024 * 1024)
+                );
+                return None;
+            }
+        }
+
+        use wa_rs::download::Downloadable;
+        let data = match client.download(image as &dyn Downloadable).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("WhatsApp Web: failed to download image: {e}");
+                return None;
+            }
+        };
+
+        if data.len() as u64 > Self::MAX_INCOMING_IMAGE_BYTES {
+            tracing::info!("WhatsApp Web: skipping image (downloaded size exceeds limit)");
+            return None;
+        }
+
+        let save_dir = workspace_dir.join("whatsapp_web_incoming");
+        if let Err(e) = tokio::fs::create_dir_all(&save_dir).await {
+            tracing::warn!("WhatsApp Web: create image incoming dir: {e}");
+            return None;
+        }
+
+        let ext = match image.mimetype.as_deref() {
+            Some(m) if m.contains("png") => "png",
+            Some(m) if m.contains("webp") => "webp",
+            Some(m) if m.contains("gif") => "gif",
+            _ => "jpg",
+        };
+        let path = save_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext));
+        if let Err(e) = tokio::fs::write(&path, &data).await {
+            tracing::warn!(
+                "WhatsApp Web: failed to save image to {}: {e}",
+                path.display()
+            );
+            return None;
+        }
+
+        tracing::info!(
+            "WhatsApp Web: saved incoming image ({} bytes) to {}",
+            data.len(),
+            path.display()
+        );
+        Some(path)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_outbound_local_image_path(&self, target: &str) -> std::path::PathBuf {
+        let p = std::path::Path::new(target.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(ref w) = self.workspace_dir {
+            w.join(p)
+        } else {
+            p.to_path_buf()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_for_outbound_image_path(path: &std::path::Path) -> &'static str {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            Some("bmp") => "image/bmp",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            _ => "image/jpeg",
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn ensure_https_image_fetch(url: &str) -> Result<()> {
+        if !url.starts_with("https://") {
+            anyhow::bail!(
+                "WhatsApp Web: only https:// URLs are allowed for fetched outbound images"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn load_outbound_image_bytes(&self, target: &str) -> Result<(Vec<u8>, String)> {
+        let t = target.trim();
+        if t.starts_with("data:image/") {
+            let comma = t
+                .find(',')
+                .ok_or_else(|| anyhow!("WhatsApp Web: invalid image data URI (missing comma)"))?;
+            let header = &t[..comma];
+            let mime = header
+                .trim_start_matches("data:")
+                .split(';')
+                .next()
+                .unwrap_or("image/jpeg")
+                .to_string();
+            if !mime.to_ascii_lowercase().starts_with("image/") {
+                anyhow::bail!("WhatsApp Web: data URI must use an image/* MIME type");
+            }
+            let payload = t[comma + 1..].trim();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .map_err(|e| anyhow!("WhatsApp Web: image data URI base64 decode failed: {e}"))?;
+            return Ok((bytes, mime));
+        }
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Self::ensure_https_image_fetch(t)?;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| anyhow!("WhatsApp Web: HTTP client build failed: {e}"))?;
+            let resp = client
+                .get(t)
+                .send()
+                .await
+                .map_err(|e| anyhow!("WhatsApp Web: image download failed: {e}"))?;
+            if !resp.status().is_success() {
+                anyhow::bail!("WhatsApp Web: image download HTTP {}", resp.status());
+            }
+            let mime = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split(';').next().map(str::trim))
+                .filter(|m| m.to_ascii_lowercase().starts_with("image/"))
+                .map(String::from)
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| anyhow!("WhatsApp Web: image body read failed: {e}"))?
+                .to_vec();
+            return Ok((bytes, mime));
+        }
+
+        let path = self.resolve_outbound_local_image_path(t);
+        if !path.is_file() {
+            anyhow::bail!(
+                "WhatsApp Web: image file not found: {}",
+                path.display()
+            );
+        }
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            anyhow!(
+                "WhatsApp Web: failed to read image {}: {e}",
+                path.display()
+            )
+        })?;
+        let mime = Self::mime_for_outbound_image_path(&path).to_string();
+        Ok((bytes, mime))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_whatsapp_image_message(
+        client: &wa_rs::Client,
+        to: &wa_rs_binary::jid::Jid,
+        bytes: Vec<u8>,
+        mime: String,
+        caption: Option<String>,
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            anyhow::bail!("WhatsApp Web: refusing to send empty image");
+        }
+        if bytes.len() as u64 > Self::MAX_INCOMING_IMAGE_BYTES {
+            anyhow::bail!(
+                "WhatsApp Web: outbound image exceeds {} MB limit",
+                Self::MAX_INCOMING_IMAGE_BYTES / (1024 * 1024)
+            );
+        }
+        use wa_rs_core::download::MediaType;
+        let upload = client
+            .upload(bytes, MediaType::Image)
+            .await
+            .map_err(|e| anyhow!("WhatsApp Web: image media upload failed: {e}"))?;
+
+        let img_msg = wa_rs_proto::whatsapp::Message {
+            image_message: Some(Box::new(wa_rs_proto::whatsapp::message::ImageMessage {
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                mimetype: Some(mime),
+                caption,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        Box::pin(client.send_message(to.clone(), img_msg))
+            .await
+            .map_err(|e| anyhow!("WhatsApp Web: failed to send image: {e}"))?;
+        Ok(())
+    }
+
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
@@ -485,6 +750,14 @@ impl Channel for WhatsAppWebChannel {
 
         let to = self.recipient_to_jid(&message.recipient)?;
 
+        let content_stripped = super::strip_tool_call_tags(&message.content);
+        let (text_body, image_refs) = crate::multimodal::parse_image_markers(&content_stripped);
+        let voice_source: &str = if image_refs.is_empty() {
+            content_stripped.as_str()
+        } else {
+            text_body.as_str()
+        };
+
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
         // A debounce task waits 10s after the last substantive message, then
@@ -496,23 +769,22 @@ impl Channel for WhatsAppWebChannel {
             .unwrap_or(false);
 
         if is_voice_chat && self.tts_config.is_some() {
-            let content = &message.content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
+            let is_substantive = voice_source.len() > 40
+                && !voice_source.starts_with("http")
+                && !voice_source.starts_with('{')
+                && !voice_source.starts_with('[')
+                && !voice_source.starts_with("Error")
+                && !voice_source.contains("```")
+                && !voice_source.contains("tool_call")
+                && !voice_source.contains("wttr.in");
 
             if is_substantive {
                 if let Ok(mut pv) = self.pending_voice.lock() {
                     pv.insert(
                         message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
+                        (voice_source.to_string(), std::time::Instant::now()),
                     );
                 }
 
@@ -565,9 +837,36 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
-        // Send text message
+        if !image_refs.is_empty() {
+            if !text_body.is_empty() {
+                let text_msg = wa_rs_proto::whatsapp::Message {
+                    conversation: Some(text_body.clone()),
+                    ..Default::default()
+                };
+                let mid = client.send_message(to.clone(), text_msg).await?;
+                tracing::debug!(
+                    "WhatsApp Web: sent caption text to {} (id: {})",
+                    message.recipient,
+                    mid
+                );
+            }
+
+            for (i, target) in image_refs.iter().enumerate() {
+                let (bytes, mime) = self.load_outbound_image_bytes(target).await?;
+                tracing::info!(
+                    "WhatsApp Web: sending image {} of {} ({} bytes, {})",
+                    i + 1,
+                    image_refs.len(),
+                    bytes.len(),
+                    mime
+                );
+                Self::send_whatsapp_image_message(&client, &to, bytes, mime, None).await?;
+            }
+            return Ok(());
+        }
+
         let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
+            conversation: Some(content_stripped.clone()),
             ..Default::default()
         };
 
@@ -649,6 +948,7 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_policy = self.dm_policy.clone();
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
+            let workspace_dir = self.workspace_dir.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -665,6 +965,7 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let workspace_dir = workspace_dir.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -776,10 +1077,26 @@ impl Channel for WhatsAppWebChannel {
                                     None
                                 };
 
+                                let image_path = if let Some(ref img) = msg.image_message {
+                                    match workspace_dir.as_deref() {
+                                        Some(ws) => {
+                                            Self::try_save_incoming_image(&client, img, ws).await
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "WhatsApp Web: incoming image skipped (workspace_dir not configured)"
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
                                 // We store the chat JID (reply_target) since that's what send() receives.
-                                let content = if let Some(ref vt) = voice_text {
+                                let text_body = if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.insert(chat.clone());
                                     }
@@ -788,15 +1105,45 @@ impl Channel for WhatsAppWebChannel {
                                     if let Ok(mut vs) = voice_chats.lock() {
                                         vs.remove(&chat);
                                     }
-                                    let text = msg.text_content().unwrap_or("");
-                                    text.trim().to_string()
+                                    msg.text_content().unwrap_or("").trim().to_string()
+                                };
+
+                                let caption = msg
+                                    .image_message
+                                    .as_ref()
+                                    .and_then(|i| i.caption.as_deref())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string());
+
+                                let body = if !text_body.is_empty() {
+                                    text_body
+                                } else if let Some(c) = caption {
+                                    c
+                                } else {
+                                    String::new()
+                                };
+
+                                let content = if let Some(ref path) = image_path {
+                                    if body.is_empty() {
+                                        format!("[IMAGE:{}]", path.display())
+                                    } else {
+                                        format!("[IMAGE:{}]\n\n{}", path.display(), body)
+                                    }
+                                } else {
+                                    body
                                 };
 
                                 tracing::info!(
-                                    "WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})",
-                                    sender.len(),
-                                    chat.len(),
-                                    content.len()
+                                    target: "whatsapp_web",
+                                    sender_jid_user = %sender,
+                                    normalized_sender_e164 = %normalized,
+                                    normalized_digit_len = normalized.trim_start_matches('+').chars().filter(|c| c.is_ascii_digit()).count(),
+                                    chat_jid = %chat,
+                                    sender_jid_len = sender.len(),
+                                    chat_jid_len = chat.len(),
+                                    content_len = content.len(),
+                                    "WhatsApp Web inbound message"
                                 );
                                 tracing::debug!(
                                     "WhatsApp Web message content: {}",
@@ -1072,6 +1419,10 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_tts(self, _config: crate::config::TtsConfig) -> Self {
+        self
+    }
+
+    pub fn with_workspace_dir(self, _dir: std::path::PathBuf) -> Self {
         self
     }
 }

@@ -17,10 +17,11 @@ pub mod static_files;
 pub mod ws;
 
 use crate::channels::{
-    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel, LinqChannel,
-    NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    append_external_channel_history_turn, send_message_to_channel, session_backend::SessionBackend,
+    session_sqlite::SqliteSessionBackend, Channel, LinqChannel, NextcloudTalkChannel, SendMessage,
+    WatiChannel, WhatsAppChannel,
 };
-use crate::config::Config;
+use crate::config::{Config, ExternalWebhookGatewayConfig};
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
@@ -65,12 +66,29 @@ pub fn gateway_request_timeout_secs() -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(REQUEST_TIMEOUT_SECS)
 }
+
+/// Default for [`gateway_agentic_webhook_timeout_secs`] — full agent + MCP on `/webhook` and `/external-webhook`.
+pub const AGENTIC_WEBHOOK_TIMEOUT_SECS_DEFAULT: u64 = 300;
+
+/// Timeout for `POST /webhook` and `POST /external-webhook` only (agent + tools + MCP init).
+/// Separate from [`gateway_request_timeout_secs`] so callers are not cut off at 30s with HTTP 408.
+pub fn gateway_agentic_webhook_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_AGENTIC_WEBHOOK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(AGENTIC_WEBHOOK_TIMEOUT_SECS_DEFAULT)
+}
+
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+
+/// Maximum `/external-webhook` agent jobs running at once after HTTP 200 is returned.
+pub const EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS: usize = 8;
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -106,6 +124,33 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+/// Memory / `process_message` session id for `/external-webhook`.
+/// For WhatsApp, uses the same scope as channel autosave / sqlite recall:
+/// [`crate::channels::whatsapp_dm_history_key_from_recipient`] — no extra headers required.
+fn resolve_external_webhook_session_id(
+    headers: &HeaderMap,
+    ext_cfg: &ExternalWebhookGatewayConfig,
+) -> String {
+    if let Some(id) = webhook_session_id(headers) {
+        return id;
+    }
+    if ext_cfg.channel.trim().eq_ignore_ascii_case("whatsapp") {
+        let recipient = ext_cfg.recipient.trim();
+        if !recipient.is_empty() {
+            return crate::channels::whatsapp_dm_history_key_from_recipient(recipient);
+        }
+    }
+    if let Some(key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("external_webhook:{key}");
+    }
+    "external_webhook".to_string()
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -322,10 +367,16 @@ pub struct AppState {
     pub auto_save: bool,
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
+    /// SHA-256 hash of `X-Webhook-Key` for `/external-webhook` when `gateway.external_webhook.webhook_key` is set.
+    pub external_webhook_key_hash: Option<Arc<str>>,
+    /// Plaintext secret for GitHub `X-Hub-Signature-256` on `/external-webhook` (HMAC-SHA256 over raw body).
+    pub external_webhook_github_secret: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    /// Limits concurrent background `/external-webhook` jobs (HTTP responds before jobs finish).
+    pub external_webhook_job_semaphore: Arc<tokio::sync::Semaphore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
@@ -520,6 +571,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 (!trimmed_secret.is_empty())
                     .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
             })
+        });
+
+    let external_webhook_key_hash: Option<Arc<str>> = config
+        .gateway
+        .external_webhook
+        .webhook_key
+        .as_ref()
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| Arc::<str>::from(hash_webhook_secret(trimmed)))
+        });
+
+    let external_webhook_github_secret: Option<Arc<str>> = config
+        .gateway
+        .external_webhook
+        .github_webhook_secret
+        .as_ref()
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| Arc::<str>::from(trimmed))
         });
 
     // WhatsApp channel (if configured)
@@ -723,6 +794,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
+    if config.gateway.external_webhook.enabled {
+        println!(
+            "  POST {pfx}/external-webhook — arbitrary body; agent summary to configured channel"
+        );
+    }
     if whatsapp_channel.is_some() {
         println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
         println!("  POST {pfx}/whatsapp  — WhatsApp message webhook");
@@ -762,6 +838,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
+    let external_webhook_job_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+    ));
+
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
 
@@ -789,10 +869,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         mem,
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
+        external_webhook_key_hash,
+        external_webhook_github_secret,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         idempotency_store,
+        external_webhook_job_semaphore,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         linq: linq_channel,
@@ -817,8 +900,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
 
+    // Full agent + MCP can exceed the default 30s gateway timeout; those routes get HTTP 408 otherwise.
+    let agentic_webhook_routes = Router::new()
+        .route("/webhook", post(handle_webhook))
+        .route("/external-webhook", post(handle_external_webhook))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(gateway_agentic_webhook_timeout_secs()),
+        ))
+        .with_state(state.clone());
+
     // Build router with middleware
     let inner = Router::new()
+        .merge(agentic_webhook_routes)
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/paircode", get(handle_admin_paircode))
@@ -827,7 +922,6 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
-        .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -1301,6 +1395,373 @@ async fn handle_webhook(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
+}
+
+/// GitHub (`application/x-www-form-urlencoded`) embeds JSON in a `payload` form field.
+fn extract_urlencoded_payload_field(body: &[u8], field: &str) -> Option<Vec<u8>> {
+    let prefix = format!("{field}=");
+    let s = std::str::from_utf8(body).ok()?;
+    for segment in s.split('&') {
+        if let Some(encoded) = segment.strip_prefix(prefix.as_str()) {
+            let decoded = urlencoding::decode(encoded).ok()?;
+            return Some(decoded.into_owned().into_bytes());
+        }
+    }
+    None
+}
+
+/// Raw body bytes for signature verification and display (unwraps `payload=` for GitHub form posts).
+fn normalized_external_webhook_body(
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    let ct = content_type.map(|ct| ct.split(';').next().unwrap_or(ct).trim());
+    if ct.is_some_and(|s| s.eq_ignore_ascii_case("application/x-www-form-urlencoded")) {
+        if let Some(inner) = extract_urlencoded_payload_field(body, "payload") {
+            return Ok(inner);
+        }
+    }
+    Ok(body.to_vec())
+}
+
+fn format_external_webhook_payload_display(body: &[u8]) -> Result<String, &'static str> {
+    let text = std::str::from_utf8(body).map_err(|_| "Invalid UTF-8 body")?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        return serde_json::to_string_pretty(&v).map_err(|_| "JSON serialization failed");
+    }
+    Ok(text.to_string())
+}
+
+fn build_external_webhook_user_message(payload_display: &str) -> String {
+    format!(
+        "An external system sent this HTTP payload. Summarize it clearly for the user: what happened, what matters, and any actions they should take.\n\n---\n{payload_display}\n---"
+    )
+}
+
+async fn run_external_webhook_job(
+    state: AppState,
+    message: String,
+    session_id: String,
+    channel_id: String,
+    recipient: String,
+) {
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let model_label = state.model.clone();
+    let started_at = Instant::now();
+
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::AgentStart {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+        });
+    state
+        .observer
+        .record_event(&crate::observability::ObserverEvent::LlmRequest {
+            provider: provider_label.clone(),
+            model: model_label.clone(),
+            messages_count: 1,
+        });
+
+    if channel_id.eq_ignore_ascii_case("whatsapp") && !recipient.is_empty() {
+        let e164 = crate::channels::normalize_whatsapp_recipient_e164(&recipient);
+        let hk = crate::channels::whatsapp_dm_history_key_from_recipient(&recipient);
+        let digits_len = e164
+            .trim_start_matches('+')
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .count();
+        tracing::info!(
+            target: "external_webhook",
+            recipient_raw = %recipient,
+            normalized_e164 = %e164,
+            e164_digit_len = digits_len,
+            session_id = %session_id,
+            history_key = %hk,
+            "external-webhook WhatsApp: outbound recipient and memory/history scope; inbound DMs must use the same normalized sender for shared context"
+        );
+    }
+
+    match run_gateway_chat_with_tools(&state, &message, Some(&session_id)).await {
+        Ok(response) => {
+            let duration = started_at.elapsed();
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: true,
+                    error_message: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            let config_snapshot = state.config.lock().clone();
+            match send_message_to_channel(&config_snapshot, &channel_id, &recipient, &response)
+                .await
+            {
+                Ok(()) => {
+                    if channel_id.eq_ignore_ascii_case("whatsapp") {
+                        let history_key =
+                            crate::channels::whatsapp_dm_history_key_from_recipient(&recipient);
+                        append_external_channel_history_turn(
+                            &history_key,
+                            ChatMessage::assistant(response),
+                        );
+                    }
+                    tracing::info!(target: "external_webhook", "external-webhook job: channel send ok");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "External webhook: failed to send to channel (async job): {e:#}"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            let duration = started_at.elapsed();
+            let sanitized = providers::sanitize_api_error(&e.to_string());
+
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::LlmResponse {
+                    provider: provider_label.clone(),
+                    model: model_label.clone(),
+                    duration,
+                    success: false,
+                    error_message: Some(sanitized.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+            state.observer.record_metric(
+                &crate::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::Error {
+                    component: "gateway".to_string(),
+                    message: sanitized.clone(),
+                });
+            state
+                .observer
+                .record_event(&crate::observability::ObserverEvent::AgentEnd {
+                    provider: provider_label,
+                    model: model_label,
+                    duration,
+                    tokens_used: None,
+                    cost_usd: None,
+                });
+
+            tracing::error!("External webhook agent error (async job): {}", sanitized);
+        }
+    }
+}
+
+/// POST /external-webhook — validate request, acknowledge immediately, then run agent + channel notify in the background.
+async fn handle_external_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/external-webhook rate limit exceeded");
+        let err = serde_json::json!({
+            "error": "Too many webhook requests. Please retry later.",
+            "retry_after": RATE_LIMIT_WINDOW_SECS,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
+    let mut github_signature_verified = false;
+    if let (Some(ref gh_secret), Some(sig)) = (
+        state.external_webhook_github_secret.as_ref(),
+        headers
+            .get("X-Hub-Signature-256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        if !verify_whatsapp_signature(gh_secret.as_ref(), &body, sig) {
+            tracing::warn!("External webhook: rejected — invalid GitHub X-Hub-Signature-256");
+            let err = serde_json::json!({
+                "error": "Unauthorized — invalid GitHub webhook signature (X-Hub-Signature-256)"
+            });
+            return (StatusCode::UNAUTHORIZED, Json(err));
+        }
+        github_signature_verified = true;
+    }
+
+    if !github_signature_verified {
+        if let Some(ref expected_hash) = state.external_webhook_key_hash {
+            let header_hash = headers
+                .get("X-Webhook-Key")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(hash_webhook_secret);
+            match header_hash {
+                Some(val) if constant_time_eq(&val, expected_hash.as_ref()) => {}
+                _ => {
+                    tracing::warn!("External webhook: rejected — invalid or missing X-Webhook-Key");
+                    let err = serde_json::json!({
+                        "error": "Unauthorized — invalid or missing X-Webhook-Key header"
+                    });
+                    return (StatusCode::UNAUTHORIZED, Json(err));
+                }
+            }
+        } else {
+            if state.pairing.require_pairing() {
+                let auth = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let token = auth.strip_prefix("Bearer ").unwrap_or("");
+                if !state.pairing.is_authenticated(token) {
+                    tracing::warn!(
+                        "External webhook: rejected — not paired / invalid bearer token"
+                    );
+                    let err = serde_json::json!({
+                        "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                    });
+                    return (StatusCode::UNAUTHORIZED, Json(err));
+                }
+            }
+
+            if let Some(ref secret_hash) = state.webhook_secret_hash {
+                let header_hash = headers
+                    .get("X-Webhook-Secret")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(hash_webhook_secret);
+                match header_hash {
+                    Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+                    _ => {
+                        tracing::warn!(
+                            "External webhook: rejected — invalid or missing X-Webhook-Secret"
+                        );
+                        let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
+                        return (StatusCode::UNAUTHORIZED, Json(err));
+                    }
+                }
+            }
+        }
+    }
+
+    let ext_cfg = {
+        let guard = state.config.lock();
+        guard.gateway.external_webhook.clone()
+    };
+
+    if !ext_cfg.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "External webhook is not enabled"})),
+        );
+    }
+
+    if ext_cfg.channel.trim().is_empty() || ext_cfg.recipient.trim().is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                serde_json::json!({"error": "External webhook is enabled but gateway.external_webhook.channel or recipient is empty"}),
+            ),
+        );
+    }
+
+    if let Some(idempotency_key) = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !state.idempotency_store.record_if_new(idempotency_key) {
+            tracing::info!(
+                "External webhook duplicate ignored (idempotency key: {idempotency_key})"
+            );
+            let body = serde_json::json!({
+                "status": "duplicate",
+                "idempotent": true,
+                "message": "Request already processed for this idempotency key"
+            });
+            return (StatusCode::OK, Json(body));
+        }
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+
+    let normalized_body = match normalized_external_webhook_body(content_type, &body) {
+        Ok(b) => b,
+        Err(e) => {
+            let err = serde_json::json!({ "error": e });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let payload_display = match format_external_webhook_payload_display(&normalized_body) {
+        Ok(s) => s,
+        Err(e) => {
+            let err = serde_json::json!({ "error": e });
+            return (StatusCode::BAD_REQUEST, Json(err));
+        }
+    };
+
+    let message = build_external_webhook_user_message(&payload_display);
+    let session_id = resolve_external_webhook_session_id(&headers, &ext_cfg);
+
+    let channel_id = ext_cfg.channel.trim().to_string();
+    let recipient = ext_cfg.recipient.trim().to_string();
+
+    tracing::info!(
+        target: "external_webhook",
+        channel = %channel_id,
+        session_id = %session_id,
+        "external-webhook accepted; scheduling background agent run (HTTP client will not wait)"
+    );
+
+    let state_bg = state.clone();
+    let sem = Arc::clone(&state.external_webhook_job_semaphore);
+    tokio::spawn(async move {
+        let permit = match sem.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::error!("external-webhook: job semaphore closed; dropped work");
+                return;
+            }
+        };
+        let _permit = permit;
+        run_external_webhook_job(state_bg, message, session_id, channel_id, recipient).await;
+    });
+
+    let body = serde_json::json!({
+        "status": "accepted",
+        "queued": true,
+        "message": "Payload accepted; agent and channel delivery run in the background.",
+    });
+    (StatusCode::OK, Json(body))
 }
 
 /// `WhatsApp` verification query params
@@ -1952,6 +2413,33 @@ mod tests {
     }
 
     #[test]
+    fn agentic_webhook_timeout_falls_back_to_default() {
+        std::env::remove_var("ZEROCLAW_GATEWAY_AGENTIC_WEBHOOK_TIMEOUT_SECS");
+        assert_eq!(
+            gateway_agentic_webhook_timeout_secs(),
+            AGENTIC_WEBHOOK_TIMEOUT_SECS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn external_webhook_extracts_github_form_payload_field() {
+        let raw = "payload=%7B%22zen%22%3A%22pong%22%7D";
+        let inner = extract_urlencoded_payload_field(raw.as_bytes(), "payload").expect("payload");
+        assert_eq!(inner, br#"{"zen":"pong"}"#.as_slice());
+    }
+
+    #[test]
+    fn normalized_external_webhook_body_unwraps_github_form() {
+        let raw = "payload=%7B%22a%22%3A1%7D";
+        let inner = normalized_external_webhook_body(
+            Some("application/x-www-form-urlencoded"),
+            raw.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(inner, br#"{"a":1}"#.as_slice());
+    }
+
+    #[test]
     fn webhook_body_requires_message_field() {
         let valid = r#"{"message": "hello"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(valid);
@@ -1989,10 +2477,15 @@ mod tests {
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2045,10 +2538,15 @@ mod tests {
             mem: Arc::new(MockMemory),
             auto_save: false,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2430,10 +2928,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2500,10 +3003,15 @@ mod tests {
             mem: memory,
             auto_save: true,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2582,10 +3090,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2636,10 +3149,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2695,10 +3213,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2736,6 +3259,60 @@ mod tests {
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn external_webhook_key_rejects_missing_header() {
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::default());
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        let key = generate_test_secret();
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(Config::default())),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: false,
+            webhook_secret_hash: None,
+            external_webhook_key_hash: Some(Arc::from(hash_webhook_secret(&key))),
+            external_webhook_github_secret: None,
+            pairing: Arc::new(PairingGuard::new(true, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
+        };
+
+        let response = handle_external_webhook(
+            State(state),
+            test_connect_info(),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     fn compute_nextcloud_signature_hex(secret: &str, random: &str, body: &str) -> String {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -2759,10 +3336,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2819,10 +3401,15 @@ mod tests {
             mem: memory,
             auto_save: false,
             webhook_secret_hash: None,
+            external_webhook_key_hash: None,
+            external_webhook_github_secret: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            external_webhook_job_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                EXTERNAL_WEBHOOK_MAX_CONCURRENT_JOBS,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,

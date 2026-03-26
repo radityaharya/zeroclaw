@@ -1,6 +1,6 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -67,8 +67,10 @@ struct NativeChatRequest {
 #[derive(Debug, Serialize)]
 struct NativeMessage {
     role: String,
+    /// String for normal messages, or a JSON array of `text` / `image_url` parts for vision
+    /// (OpenAI Chat Completions multimodal user messages).
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +236,38 @@ impl OpenAiProvider {
         })
     }
 
+    /// OpenAI Chat Completions vision: `content` is an array of parts with `type: "text"` and
+    /// `type: "image_url"` (`image_url.url` is a `https://` URL or `data:image/...;base64,...`).
+    /// See <https://platform.openai.com/docs/guides/images-vision>.
+    fn user_content_openai_multimodal(raw: &str) -> serde_json::Value {
+        let (cleaned_text, refs) = crate::multimodal::parse_image_markers(raw);
+        if refs.is_empty() {
+            return serde_json::Value::String(raw.to_string());
+        }
+        let mut parts: Vec<serde_json::Value> = Vec::new();
+        let trimmed = cleaned_text.trim();
+        if !trimmed.is_empty() {
+            parts.push(serde_json::json!({
+                "type": "text",
+                "text": trimmed,
+            }));
+        }
+        for reference in refs {
+            let url = reference.trim();
+            if url.is_empty() {
+                continue;
+            }
+            parts.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": url }
+            }));
+        }
+        if parts.is_empty() {
+            return serde_json::Value::String(raw.to_string());
+        }
+        serde_json::Value::Array(parts)
+    }
+
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
         messages
             .iter()
@@ -267,7 +301,7 @@ impl OpenAiProvider {
                                     .map(ToString::to_string);
                                 return NativeMessage {
                                     role: "assistant".to_string(),
-                                    content,
+                                    content: content.map(serde_json::Value::String),
                                     tool_call_id: None,
                                     tool_calls: Some(tool_calls),
                                     reasoning_content,
@@ -289,7 +323,7 @@ impl OpenAiProvider {
                             .map(ToString::to_string);
                         return NativeMessage {
                             role: "tool".to_string(),
-                            content,
+                            content: content.map(serde_json::Value::String),
                             tool_call_id,
                             tool_calls: None,
                             reasoning_content: None,
@@ -297,9 +331,15 @@ impl OpenAiProvider {
                     }
                 }
 
+                let content = if m.role == "user" {
+                    Self::user_content_openai_multimodal(&m.content)
+                } else {
+                    serde_json::Value::String(m.content.clone())
+                };
+
                 NativeMessage {
                     role: m.role.clone(),
-                    content: Some(m.content.clone()),
+                    content: Some(content),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -337,6 +377,14 @@ impl OpenAiProvider {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            vision: true,
+            prompt_caching: false,
+        }
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -854,7 +902,7 @@ mod tests {
     fn native_message_omits_reasoning_content_when_none() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(serde_json::Value::String("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
@@ -867,7 +915,7 @@ mod tests {
     fn native_message_includes_reasoning_content_when_some() {
         let msg = NativeMessage {
             role: "assistant".to_string(),
-            content: Some("hi".to_string()),
+            content: Some(serde_json::Value::String("hi".to_string())),
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
@@ -875,6 +923,36 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("reasoning_content"));
         assert!(json.contains("thinking..."));
+    }
+
+    #[test]
+    fn convert_messages_user_image_markers_become_openai_content_parts() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::user(
+            "What is this?\n\n[IMAGE:data:image/png;base64,AAAA]".to_string(),
+        )];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(native.len(), 1);
+        let content = native[0].content.as_ref().expect("content");
+        let parts = content.as_array().expect("multimodal content is array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "What is this?");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn convert_messages_plain_user_stays_string_content() {
+        use crate::providers::ChatMessage;
+
+        let messages = vec![ChatMessage::user("hello".to_string())];
+        let native = OpenAiProvider::convert_messages(&messages);
+        assert_eq!(
+            native[0].content,
+            Some(serde_json::Value::String("hello".to_string()))
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════

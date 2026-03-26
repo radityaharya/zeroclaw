@@ -295,7 +295,7 @@ impl PromptSection for ChannelMediaSection {
         Ok("## Channel Media Markers\n\n\
             Messages from channels may contain media markers:\n\
             - `[Voice] <text>` — The user sent a voice/audio message that has already been transcribed to text. Respond to the transcribed content directly.\n\
-            - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
+            - `[IMAGE:…]` — An image attachment (content is a real filesystem path or URL), processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
     }

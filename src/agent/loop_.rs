@@ -7,9 +7,7 @@ use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
-use crate::providers::{
-    self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
-};
+use crate::providers::{self, ChatMessage, ChatRequest, Provider, ToolCall};
 use crate::runtime;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
@@ -2706,18 +2704,6 @@ pub(crate) async fn run_tool_call_loop(
         }
         let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
-        let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
-            }
-            .into());
-        }
-
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
 
@@ -5026,7 +5012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_returns_structured_error_for_non_vision_provider() {
+    async fn run_tool_call_loop_passes_images_to_non_vision_provider() {
         let calls = Arc::new(AtomicUsize::new(0));
         let provider = NonVisionProvider {
             calls: Arc::clone(&calls),
@@ -5038,7 +5024,7 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
+        let response = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -5062,11 +5048,10 @@ mod tests {
             &crate::config::PacingConfig::default(),
         )
         .await
-        .expect_err("provider without vision support should fail");
+        .expect("non-vision provider should still accept prepared multimodal messages");
 
-        assert!(err.to_string().contains("provider_capability_error"));
-        assert!(err.to_string().contains("capability=vision"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(response, "ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

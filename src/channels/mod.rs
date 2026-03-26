@@ -174,6 +174,56 @@ type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
+
+/// Bridges gateway outbound sends (e.g. `/external-webhook`) into the same
+/// `conversation_histories` + session store used by the channel server, so the
+/// next inbound user message includes prior assistant text.
+static CHANNEL_SESSION_BRIDGE: Mutex<Option<ChannelSessionBridge>> = Mutex::new(None);
+
+struct ChannelSessionBridge {
+    histories: ConversationHistoryMap,
+    session_store: Option<Arc<session_store::SessionStore>>,
+}
+
+impl ChannelSessionBridge {
+    fn append_turn(&self, sender_key: &str, turn: ChatMessage) {
+        if let Some(ref store) = self.session_store {
+            if let Err(e) = store.append(sender_key, &turn) {
+                tracing::warn!("Failed to persist session turn (outbound bridge): {e}");
+            }
+        }
+        let mut histories = self.histories.lock().unwrap_or_else(|e| e.into_inner());
+        let turns = histories.entry(sender_key.to_string()).or_default();
+        turns.push(turn);
+        while turns.len() > MAX_CHANNEL_HISTORY {
+            turns.remove(0);
+        }
+    }
+}
+
+fn register_channel_session_bridge(
+    histories: ConversationHistoryMap,
+    session_store: Option<Arc<session_store::SessionStore>>,
+) {
+    let mut guard = CHANNEL_SESSION_BRIDGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = Some(ChannelSessionBridge {
+        histories,
+        session_store,
+    });
+}
+
+/// Append a turn after gateway-originated outbound chat (e.g. `/external-webhook` summary).
+/// No-op when the channel server has not registered (gateway-only mode).
+pub fn append_external_channel_history_turn(key: &str, turn: ChatMessage) {
+    let guard = CHANNEL_SESSION_BRIDGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(ref bridge) = *guard {
+        bridge.append_turn(key, turn);
+    }
+}
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
@@ -418,6 +468,26 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+/// WhatsApp 1:1 DM: key sessions on `reply_target` + E.164 from the chat JID user part.
+/// `msg.sender` can differ from PN/LID candidate lists (e.g. +628…2002 vs +628…286) and must
+/// not split history from `/external-webhook` (see `whatsapp_dm_history_key_from_recipient`).
+fn whatsapp_dm_history_key_from_reply_target(reply_target: &str) -> Option<String> {
+    let rt = reply_target.trim();
+    if rt.contains("@g.us") {
+        return None;
+    }
+    if !rt.ends_with("@s.whatsapp.net") {
+        return None;
+    }
+    let user = rt.strip_suffix("@s.whatsapp.net")?;
+    let digits: String = user.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let e164 = format!("+{digits}");
+    Some(format!("whatsapp_{}_{}", rt, e164))
+}
+
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
@@ -426,7 +496,14 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        None => {
+            if msg.channel == "whatsapp" {
+                if let Some(key) = whatsapp_dm_history_key_from_reply_target(&msg.reply_target) {
+                    return key;
+                }
+            }
+            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+        }
     }
 }
 
@@ -591,7 +668,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use emoji naturally to add personality — but don't overdo it\n\
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - For media attachments put the real path or https URL inside markers, e.g. [IMAGE:/workspace/shot.png] or [IMAGE:https://example.com/a.jpg]; same pattern for [DOCUMENT:…], [VIDEO:…], [AUDIO:…], [VOICE:…]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
@@ -599,10 +676,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on QQ:\n\
              - Use Markdown formatting\n\
              - Be concise and direct\n\
-             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
-               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - For media attachments use a real path or https URL, e.g. [IMAGE:/tmp/cap.png] or [IMAGE:https://example.com/x.jpg]; likewise [DOCUMENT:…], [VIDEO:…], [VOICE:…]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "whatsapp" => Some(
+            "When responding on WhatsApp:\n\
+             - Be concise and direct\n\
+             - To send a photo the user can open in chat, include [IMAGE:/absolute/or/workspace-relative/path.png] or [IMAGE:https://…] (https only). Plain filenames are resolved under the agent workspace.\n\
+             - Put any caption as normal text in the same message, outside the marker.\n\
+             - Keep markers out of code fences.\n",
         ),
         _ => None,
     }
@@ -673,7 +756,14 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
             (false, "user") | (true, "assistant") => {
-                if let Some(last_turn) = normalized.last_mut() {
+                if normalized.is_empty() {
+                    // Outbound-only turns (e.g. `/external-webhook` append) can leave
+                    // assistant before any user; merging into "last" would drop them.
+                    if turn.role == "assistant" {
+                        normalized.push(turn);
+                        expecting_user = true;
+                    }
+                } else if let Some(last_turn) = normalized.last_mut() {
                     if !turn.content.is_empty() {
                         if !last_turn.content.is_empty() {
                             last_turn.content.push_str("\n\n");
@@ -2077,6 +2167,15 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+    if msg.channel == "whatsapp" {
+        tracing::info!(
+            target: "whatsapp",
+            sender = %msg.sender,
+            reply_target = %msg.reply_target,
+            history_key = %history_key,
+            "WhatsApp channel message routing (history/memory key)"
+        );
+    }
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Query classification: override route when a rule matches ──
@@ -2190,29 +2289,6 @@ async fn process_channel_message(
         }
     }
 
-    // Strip [IMAGE:] markers from *older* history messages when the active
-    // provider does not support vision. This prevents "history poisoning"
-    // where a previously-sent image marker gets reloaded from the JSONL
-    // session file and permanently breaks the conversation (fixes #3674).
-    // We skip the last turn (the current message) so the vision check can
-    // still reject fresh image sends with a proper error.
-    if !active_provider.supports_vision() && prior_turns.len() > 1 {
-        let last_idx = prior_turns.len() - 1;
-        for turn in &mut prior_turns[..last_idx] {
-            if turn.content.contains("[IMAGE:") {
-                let (cleaned, _refs) = crate::multimodal::parse_image_markers(&turn.content);
-                turn.content = cleaned;
-            }
-        }
-        // Drop older turns that became empty after marker removal (e.g. image-only messages).
-        // Keep the last turn (current message) intact.
-        let current = prior_turns.pop();
-        prior_turns.retain(|turn| !turn.content.trim().is_empty());
-        if let Some(current) = current {
-            prior_turns.push(current);
-        }
-    }
-
     // Proactively trim conversation history before sending to the provider
     // to prevent context-window-exceeded errors (bug #3460).
     let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
@@ -2238,7 +2314,11 @@ async fn process_channel_message(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        Some(&msg.sender),
+        if is_group_chat {
+            Some(&msg.sender)
+        } else {
+            Some(&history_key)
+        },
     );
 
     let (sender_memory, group_memory) = if is_group_chat {
@@ -3659,23 +3739,165 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_workspace_dir(config.workspace_dir.clone()),
             ))
         }
-        other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
+        "whatsapp" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .context("WhatsApp channel is not configured")?;
+            if wa.is_ambiguous_config() {
+                tracing::warn!(
+                    "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                );
+            }
+            match wa.backend_type() {
+                "cloud" => {
+                    if wa.is_cloud_config() {
+                        Ok(Arc::new(
+                            WhatsAppChannel::new(
+                                wa.access_token.clone().unwrap_or_default(),
+                                wa.phone_number_id.clone().unwrap_or_default(),
+                                wa.verify_token.clone().unwrap_or_default(),
+                                wa.allowed_numbers.clone(),
+                            )
+                            .with_proxy_url(wa.proxy_url.clone()),
+                        ))
+                    } else {
+                        anyhow::bail!(
+                            "WhatsApp Cloud API is not fully configured (missing phone_number_id, access_token, or verify_token)"
+                        )
+                    }
+                }
+                "web" => {
+                    #[cfg(feature = "whatsapp-web")]
+                    {
+                        if wa.is_web_config() {
+                            Ok(Arc::new(
+                                whatsapp_web::WhatsAppWebChannel::new(
+                                    wa.session_path.clone().unwrap_or_default(),
+                                    wa.pair_phone.clone(),
+                                    wa.pair_code.clone(),
+                                    wa.allowed_numbers.clone(),
+                                    wa.mode.clone(),
+                                    wa.dm_policy.clone(),
+                                    wa.group_policy.clone(),
+                                    wa.self_chat_mode,
+                                )
+                                .with_workspace_dir(config.workspace_dir.clone())
+                                .with_transcription(config.transcription.clone())
+                                .with_tts(config.tts.clone()),
+                            ))
+                        } else {
+                            anyhow::bail!("WhatsApp Web session_path is not set")
+                        }
+                    }
+                    #[cfg(not(feature = "whatsapp-web"))]
+                    {
+                        anyhow::bail!(
+                            "WhatsApp Web requires the whatsapp-web feature (rebuild with --features whatsapp-web)"
+                        )
+                    }
+                }
+                _ => anyhow::bail!(
+                    "WhatsApp is not configured (set phone_number_id for Cloud API or session_path for Web)"
+                ),
+            }
+        }
+        other => anyhow::bail!(
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, whatsapp"
+        ),
     }
 }
 
-/// Send a one-off message to a configured channel.
-async fn send_channel_message(
+/// Normalize a phone-like recipient to E.164 `+<digits>` for memory session scoping.
+/// Matches WhatsApp channel `sender` normalization so `process_message` recall aligns with DMs.
+pub fn normalize_whatsapp_recipient_e164(recipient: &str) -> String {
+    let trimmed = recipient.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let user_part = trimmed
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(trimmed)
+        .trim();
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("+{digits}")
+    }
+}
+
+/// WhatsApp DM memory scope: same string as [`conversation_history_key`] for that chat
+/// (`whatsapp_{chat JID}_{+digits from JID user part}` for 1:1). Inbound DMs derive from
+/// `reply_target`, not `sender`, so PN/LID variants do not split sessions from external webhook.
+/// Autosave and sqlite recall use this as `session_id`; external webhook must use it too.
+pub fn whatsapp_dm_history_key_from_recipient(recipient: &str) -> String {
+    let trimmed = recipient.trim();
+    let sender = normalize_whatsapp_recipient_e164(trimmed);
+    let reply_target = if trimmed.contains('@') {
+        trimmed.to_string()
+    } else {
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return format!("whatsapp_unknown_{sender}");
+        }
+        format!("{digits}@s.whatsapp.net")
+    };
+    format!("whatsapp_{}_{}", reply_target, sender)
+}
+
+/// Send a one-off message to a configured channel (e.g. Telegram, Discord, Slack, WhatsApp).
+pub async fn send_message_to_channel(
     config: &Config,
     channel_id: &str,
     recipient: &str,
     message: &str,
 ) -> Result<()> {
+    if channel_id == "whatsapp" {
+        if let Some(ref wa) = config.channels_config.whatsapp {
+            if wa.backend_type() == "web" && wa.is_web_config() {
+                #[cfg(feature = "whatsapp-web")]
+                {
+                    if let Some(ch) = whatsapp_web::outbound_whatsapp_web_for_config(config) {
+                        let msg = SendMessage::new(message, recipient);
+                        return ch
+                            .send(&msg)
+                            .await
+                            .with_context(|| format!("Failed to send message via {channel_id}"));
+                    }
+                    anyhow::bail!(
+                        "WhatsApp Web is not active in this process. Run `zeroclaw daemon` \
+                         (or `zeroclaw channel start` in the same process as the gateway) so the \
+                         WhatsApp session connects, then retry. Gateway-only mode cannot send via Web."
+                    );
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    anyhow::bail!("WhatsApp Web requires building with --features whatsapp-web");
+                }
+            }
+        }
+    }
+
     let channel = build_channel_by_id(config, channel_id)?;
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
         .await
         .with_context(|| format!("Failed to send message via {channel_id}"))?;
+    Ok(())
+}
+
+/// Send a one-off message to a configured channel (CLI — prints confirmation).
+async fn send_channel_message(
+    config: &Config,
+    channel_id: &str,
+    recipient: &str,
+    message: &str,
+) -> Result<()> {
+    send_message_to_channel(config, channel_id, recipient, message).await?;
     println!("Message sent via {channel_id}.");
     Ok(())
 }
@@ -3705,8 +3927,11 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
+    register_whatsapp_web_outbound: bool,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
+    #[cfg(not(feature = "whatsapp-web"))]
+    let _ = register_whatsapp_web_outbound;
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -3862,22 +4087,30 @@ fn collect_configured_channels(
                 // Web mode: requires session_path
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
+                    let wa_ch = Arc::new(
+                        WhatsAppWebChannel::new(
+                            wa.session_path.clone().unwrap_or_default(),
+                            wa.pair_phone.clone(),
+                            wa.pair_code.clone(),
+                            wa.allowed_numbers.clone(),
+                            wa.mode.clone(),
+                            wa.dm_policy.clone(),
+                            wa.group_policy.clone(),
+                            wa.self_chat_mode,
+                        )
+                        .with_workspace_dir(config.workspace_dir.clone())
+                        .with_transcription(config.transcription.clone())
+                        .with_tts(config.tts.clone()),
+                    );
+                    if register_whatsapp_web_outbound {
+                        let key =
+                            shellexpand::tilde(wa.session_path.as_deref().unwrap_or_default())
+                                .to_string();
+                        whatsapp_web::register_whatsapp_web_for_outbound(key, Arc::clone(&wa_ch));
+                    }
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
-                        channel: Arc::new(
-                            WhatsAppWebChannel::new(
-                                wa.session_path.clone().unwrap_or_default(),
-                                wa.pair_phone.clone(),
-                                wa.pair_code.clone(),
-                                wa.allowed_numbers.clone(),
-                                wa.mode.clone(),
-                                wa.dm_policy.clone(),
-                                wa.group_policy.clone(),
-                                wa.self_chat_mode,
-                            )
-                            .with_transcription(config.transcription.clone())
-                            .with_tts(config.tts.clone()),
-                        ),
+                        channel: wa_ch,
                     });
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
@@ -4134,7 +4367,7 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check", false);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
@@ -4194,6 +4427,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    #[cfg(feature = "whatsapp-web")]
+    whatsapp_web::clear_whatsapp_web_outbound_registry();
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -4480,7 +4716,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup", true)
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -4684,6 +4920,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
             tracing::info!("📂 Restored {hydrated} session(s) from disk");
         }
     }
+
+    register_channel_session_bridge(
+        Arc::clone(&runtime_ctx.conversation_histories),
+        runtime_ctx.session_store.clone(),
+    );
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
@@ -4904,6 +5145,20 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_keeps_leading_assistant_before_user() {
+        let turns = vec![
+            ChatMessage::assistant("outbound summary from external webhook"),
+            ChatMessage::user("again?"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0].role, "assistant");
+        assert_eq!(normalized[1].role, "user");
+        assert_eq!(normalized[1].content, "again?");
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
@@ -7926,6 +8181,46 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn whatsapp_dm_history_key_matches_conversation_history_key() {
+        let msg = traits::ChannelMessage {
+            id: "m1".into(),
+            sender: "+15551234567".into(),
+            reply_target: "15551234567@s.whatsapp.net".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+        };
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("+1 555 123 4567")
+        );
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("15551234567@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn whatsapp_dm_history_key_uses_chat_jid_when_sender_candidate_differs() {
+        let msg = traits::ChannelMessage {
+            id: "m1".into(),
+            sender: "+628121922200286".into(),
+            reply_target: "6281219222002@s.whatsapp.net".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+        };
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("+6281219222002")
+        );
+    }
+
+    #[test]
     fn followup_thread_id_prefers_thread_ts() {
         let msg = traits::ChannelMessage {
             id: "slack_C123_1741234567.123456".into(),
@@ -8882,7 +9177,7 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", false);
 
         assert!(channels
             .iter()
@@ -9073,14 +9368,14 @@ This is an example JSON object for profile settings."#;
         assert!(result.is_empty());
     }
 
-    // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
+    // ── E2E: photo [IMAGE:] reaches LLM even when provider omits vision ───
 
-    /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
-    /// marker) sent through `process_channel_message` with a non-vision
-    /// provider must produce a `"⚠️ Error: …does not support vision"` reply
-    /// on the recording channel — no real Telegram or LLM API required.
+    /// Inline data-URI image so multimodal prep succeeds without a real file.
+    const E2E_MIN_PNG_IMAGE_INLINE: &str = "[IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==]";
+
+    /// Non-vision `DummyProvider` still receives prepared multimodal user text.
     #[tokio::test]
-    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+    async fn e2e_photo_attachment_succeeds_with_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -9144,7 +9439,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("{}\n\nWhat is this?", E2E_MIN_PNG_IMAGE_INLINE),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
@@ -9157,19 +9452,14 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("does not support vision"),
-            "reply must mention vision capability error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[0].contains("⚠️ Error"),
-            "reply must start with error prefix, got: {}",
+            sent[0].ends_with(":ok"),
+            "expected dummy LLM reply, got: {}",
             sent[0]
         );
     }
 
     #[tokio::test]
-    async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
+    async fn e2e_image_turn_then_text_turn_with_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -9231,7 +9521,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-photo-1".to_string(),
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
-                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                content: format!("{}\n\nWhat is this?", E2E_MIN_PNG_IMAGE_INLINE),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
@@ -9258,10 +9548,10 @@ This is an example JSON object for profile settings."#;
         .await;
 
         let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
+        assert_eq!(sent.len(), 2, "expected two successful replies");
         assert!(
-            sent[0].contains("does not support vision"),
-            "first reply must mention vision capability error, got: {}",
+            sent[0].ends_with(":ok"),
+            "first reply should succeed, got: {}",
             sent[0]
         );
         assert!(
@@ -9278,15 +9568,18 @@ This is an example JSON object for profile settings."#;
         let turns = histories
             .get("test-channel_chat-photo_zeroclaw_user")
             .expect("history should exist for sender");
-        assert_eq!(turns.len(), 2);
+        assert_eq!(turns.len(), 4);
         assert_eq!(turns[0].role, "user");
-        assert_eq!(turns[0].content, "What is WAL?");
+        assert!(
+            turns[0].content.contains("[IMAGE:"),
+            "first user turn should retain original image marker text"
+        );
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "ok");
-        assert!(
-            turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
-            "failed vision turn must not persist image marker content"
-        );
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[2].content, "What is WAL?");
+        assert_eq!(turns[3].role, "assistant");
+        assert_eq!(turns[3].content, "ok");
     }
 
     #[test]

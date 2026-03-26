@@ -50,6 +50,35 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
+/// Targets copied from prompt examples like `[IMAGE:<path-or-url>]` are not real paths;
+/// leave the marker in the text instead of treating it as an attachment.
+fn is_placeholder_image_target(target: &str) -> bool {
+    let t = target.trim();
+    if !t.starts_with('<') || !t.ends_with('>') || t.len() < 3 {
+        return false;
+    }
+    let inner = t[1..t.len() - 1].trim();
+    if inner.is_empty() {
+        return false;
+    }
+    let lower = inner.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "path-or-url" | "path" | "url" | "file" | "file-path" | "image-url" | "image" | "link"
+    ) {
+        return true;
+    }
+    if inner.len() > 48 {
+        return false;
+    }
+    if inner.contains('/') || inner.contains('\\') || inner.contains(':') {
+        return false;
+    }
+    inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     let mut refs = Vec::new();
     let mut cleaned = String::with_capacity(content.len());
@@ -69,7 +98,7 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
         let end = marker_start + rel_end;
         let candidate = content[marker_start..end].trim();
 
-        if candidate.is_empty() {
+        if candidate.is_empty() || is_placeholder_image_target(candidate) {
             cleaned.push_str(&content[start..=end]);
         } else {
             refs.push(candidate.to_string());
@@ -464,6 +493,14 @@ mod tests {
         let (cleaned, refs) = parse_image_markers(input);
 
         assert_eq!(cleaned, "hello [IMAGE:] world");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn parse_image_markers_keeps_doc_placeholder_targets() {
+        let input = "see [IMAGE:<path-or-url>] please";
+        let (cleaned, refs) = parse_image_markers(input);
+        assert_eq!(cleaned, "see [IMAGE:<path-or-url>] please");
         assert!(refs.is_empty());
     }
 

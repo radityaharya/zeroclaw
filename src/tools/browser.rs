@@ -256,6 +256,17 @@ impl BrowserTool {
         Self::is_agent_browser_available().await
     }
 
+    /// Resolve a screenshot `path` argument via [`SecurityPolicy::resolve_tool_path`].
+    ///
+    /// Relative names (e.g. `shot.png`) target the agent workspace instead of the
+    /// process working directory, which is often `/` or unset for systemd services.
+    fn resolve_screenshot_path(&self, raw: &str) -> String {
+        self.security
+            .resolve_tool_path(raw)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn configured_backend(&self) -> anyhow::Result<BrowserBackendKind> {
         BrowserBackendKind::parse(&self.backend)
     }
@@ -556,14 +567,15 @@ impl BrowserTool {
             }
 
             BrowserAction::Screenshot { path, full_page } => {
-                let mut args = vec!["screenshot"];
-                if let Some(ref p) = path {
-                    args.push(p);
+                let mut parts: Vec<String> = vec!["screenshot".into()];
+                if let Some(p) = path.as_ref() {
+                    parts.push(self.resolve_screenshot_path(p));
                 }
                 if full_page {
-                    args.push("--full");
+                    parts.push("--full".into());
                 }
-                let resp = self.run_command(&args).await?;
+                let arg_refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
+                let resp = self.run_command(&arg_refs).await?;
                 self.to_result(resp)
             }
 
@@ -997,7 +1009,7 @@ impl Tool for BrowserTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path for screenshot"
+                    "description": "File path for screenshot (relative paths are resolved under the agent workspace)"
                 },
                 "ms": {
                     "type": "integer",
@@ -1249,7 +1261,8 @@ mod native_backend {
                         "bytes": png.len(),
                     });
 
-                    if let Some(path_str) = path {
+                    if let Some(path_raw) = path {
+                        let path_str = self.resolve_screenshot_path(&path_raw);
                         tokio::fs::write(&path_str, &png)
                             .await
                             .with_context(|| format!("Failed to write screenshot to {path_str}"))?;

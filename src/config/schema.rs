@@ -1658,6 +1658,41 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Configuration for `POST /external-webhook` — ingest an arbitrary HTTP body,
+/// run the full agent, and send the reply text to a configured chat channel.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExternalWebhookGatewayConfig {
+    /// When true, `POST /external-webhook` is accepted (subject to auth and channel settings).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Channel id: `telegram`, `discord`, `slack`, or `whatsapp` (must match a configured channel).
+    #[serde(default)]
+    pub channel: String,
+    /// Recipient (chat/channel id; WhatsApp Cloud API: E.164 phone, e.g. `+15551234567`).
+    #[serde(default)]
+    pub recipient: String,
+    /// When set, `/external-webhook` requires header `X-Webhook-Key` with this same value (compared like `channels.webhook.secret`).
+    /// Pairing and the global `X-Webhook-Secret` are not used for this endpoint when this is set.
+    #[serde(default)]
+    pub webhook_key: Option<String>,
+    /// When set, requests that include GitHub's `X-Hub-Signature-256` header are verified with this secret (HMAC-SHA256 over the raw body).
+    /// Use the same value as GitHub's webhook "Secret" field. Requests without that header still use `webhook_key` / pairing / `X-Webhook-Secret`.
+    #[serde(default)]
+    pub github_webhook_secret: Option<String>,
+}
+
+impl Default for ExternalWebhookGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel: String::new(),
+            recipient: String::new(),
+            webhook_key: None,
+            github_webhook_secret: None,
+        }
+    }
+}
+
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
@@ -1722,6 +1757,10 @@ pub struct GatewayConfig {
     /// Pairing dashboard configuration
     #[serde(default)]
     pub pairing_dashboard: PairingDashboardConfig,
+
+    /// Ingest arbitrary POST bodies at `/external-webhook` and notify a channel.
+    #[serde(default)]
+    pub external_webhook: ExternalWebhookGatewayConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1778,6 +1817,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            external_webhook: ExternalWebhookGatewayConfig::default(),
         }
     }
 }
@@ -10947,6 +10987,7 @@ channel_id = "C123"
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            external_webhook: ExternalWebhookGatewayConfig::default(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
