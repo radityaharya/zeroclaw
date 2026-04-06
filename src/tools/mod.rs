@@ -110,6 +110,7 @@ pub mod weather_tool;
 pub mod web_fetch;
 mod web_search_provider_routing;
 pub mod web_search_tool;
+pub mod whatsapp_send;
 pub mod workspace_tool;
 pub mod wrappers;
 
@@ -210,6 +211,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
+pub use whatsapp_send::WhatsappSendTool;
 pub use workspace_tool::WorkspaceTool;
 pub use wrappers::{PathGuardedTool, RateLimitedTool};
 
@@ -776,6 +778,13 @@ pub fn all_tools_with_runtime(
         security.clone(),
         Arc::clone(&channel_map_handle),
     )));
+
+    if root_config.channels_config.whatsapp.is_some() {
+        tool_arcs.push(Arc::new(WhatsappSendTool::new(
+            security.clone(),
+            Arc::clone(&config),
+        )));
+    }
 
     // SOP tools (registered when sops_dir is configured)
     if root_config.sop.sops_dir.is_some() {

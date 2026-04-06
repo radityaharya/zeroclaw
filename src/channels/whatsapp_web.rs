@@ -18,7 +18,7 @@
 //! [channels_config.whatsapp]
 //! session_path = "~/.zeroclaw/whatsapp-session.db"  # Required for Web mode
 //! pair_phone = "15551234567"  # Optional: for pair code linking
-//! allowed_numbers = ["+1234567890", "*"]  # Same as Cloud API
+//! allowed_numbers = ["+1234567890", "*"]  # Use [] (or omit) for operator pairing: daemon prints a code; send `/bind <code>` from WhatsApp
 //! ```
 //!
 //! # Runtime Negotiation
@@ -28,11 +28,15 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::{Result, anyhow};
+use crate::config::Config;
+use crate::security::pairing::PairingGuard;
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use directories::UserDirs;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
 
@@ -48,8 +52,49 @@ use wa_rs_proto::whatsapp::device_props::PlatformType;
 /// [channels_config.whatsapp]
 /// session_path = "~/.zeroclaw/whatsapp-session.db"
 /// pair_phone = "15551234567"  # Optional
-/// allowed_numbers = ["+1234567890", "*"]
+/// allowed_numbers = ["+1234567890", "*"]  # empty list + no "*" enables `/bind <code>` pairing
 /// ```
+#[cfg(feature = "whatsapp-web")]
+const WHATSAPP_BIND_COMMAND: &str = "/bind";
+
+#[cfg(feature = "whatsapp-web")]
+static WHATSAPP_WEB_OUTBOUND: OnceLock<Mutex<HashMap<String, Arc<WhatsAppWebChannel>>>> =
+    OnceLock::new();
+
+/// Clear outbound registry (gateway `/external-webhook` shares the listener's connected client).
+#[cfg(feature = "whatsapp-web")]
+pub fn clear_whatsapp_web_outbound_registry() {
+    if let Some(m) = WHATSAPP_WEB_OUTBOUND.get() {
+        m.lock().clear();
+    }
+}
+
+/// Register the same `Arc` used by the channel listener so outbound sends share the connected client.
+#[cfg(feature = "whatsapp-web")]
+pub fn register_whatsapp_web_for_outbound(
+    session_path_expanded: String,
+    ch: Arc<WhatsAppWebChannel>,
+) {
+    let map = WHATSAPP_WEB_OUTBOUND.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock().insert(session_path_expanded, ch);
+}
+
+/// Resolve the live WhatsApp Web channel for this config (same process as `channel start` / `daemon`).
+#[cfg(feature = "whatsapp-web")]
+pub fn outbound_whatsapp_web_for_config(
+    config: &crate::config::Config,
+) -> Option<Arc<WhatsAppWebChannel>> {
+    let wa = config.channels_config.whatsapp.as_ref()?;
+    let sp = wa.session_path.as_ref()?;
+    if !wa.is_web_config() {
+        return None;
+    }
+    let key = shellexpand::tilde(sp).to_string();
+    WHATSAPP_WEB_OUTBOUND
+        .get()
+        .and_then(|m| m.lock().get(&key).cloned())
+}
+
 #[cfg(feature = "whatsapp-web")]
 pub struct WhatsAppWebChannel {
     /// Session database path
@@ -58,12 +103,14 @@ pub struct WhatsAppWebChannel {
     pair_phone: Option<String>,
     /// Custom pair code (optional)
     pair_code: Option<String>,
-    /// Allowed phone numbers (E.164 format) or "*" for all
-    allowed_numbers: Vec<String>,
+    /// Allowed phone numbers (E.164 format) or "*" for all (runtime-updated when pairing binds)
+    allowed_numbers: Arc<RwLock<Vec<String>>>,
     /// When true, only respond to messages that @-mention the bot in groups
     mention_only: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
+    /// Operator pairing when the config allowlist is empty and does not contain "*"
+    pairing: Option<PairingGuard>,
     /// Usage mode (business vs personal policy filtering)
     mode: crate::config::WhatsAppWebMode,
     /// DM policy when mode = personal
@@ -138,13 +185,33 @@ impl WhatsAppWebChannel {
             );
         }
 
+        let normalized_allow: Vec<String> = allowed_numbers
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let has_wildcard = normalized_allow.iter().any(|e| e == "*");
+        let pairing = if !has_wildcard && normalized_allow.is_empty() {
+            let guard = PairingGuard::new(true, &[]);
+            if let Some(code) = guard.pairing_code() {
+                println!("  🔐 WhatsApp pairing required. One-time bind code: {code}");
+                println!(
+                    "     Send `{WHATSAPP_BIND_COMMAND} <code>` from WhatsApp (DM this linked account)."
+                );
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         Self {
             session_path,
             pair_phone,
             pair_code,
-            allowed_numbers,
+            allowed_numbers: Arc::new(RwLock::new(normalized_allow)),
             mention_only,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
+            pairing,
             mode,
             dm_policy,
             group_policy,
@@ -216,7 +283,223 @@ impl WhatsAppWebChannel {
     /// Check if a phone number is allowed (E.164 format: +1234567890)
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed(&self, phone: &str) -> bool {
-        Self::is_number_allowed_for_list(&self.allowed_numbers, phone)
+        let snapshot = self.allowed_numbers.read().ok();
+        snapshot
+            .as_ref()
+            .map(|s| Self::is_number_allowed_for_list(s, phone))
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_code_active(&self) -> bool {
+        self.pairing
+            .as_ref()
+            .and_then(PairingGuard::pairing_code)
+            .is_some()
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_bind_code(text: &str) -> Option<&str> {
+        let mut parts = text.split_whitespace();
+        let command = parts.next()?;
+        let base_command = command.split('@').next().unwrap_or(command);
+        if base_command != WHATSAPP_BIND_COMMAND {
+            return None;
+        }
+        parts.next().map(str::trim).filter(|code| !code.is_empty())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn load_config_without_env_whatsapp() -> anyhow::Result<Config> {
+        let home = UserDirs::new()
+            .map(|u| u.home_dir().to_path_buf())
+            .context("Could not find home directory")?;
+        let zeroclaw_dir = home.join(".zeroclaw");
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        let contents = tokio::fs::read_to_string(&config_path)
+            .await
+            .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
+        let mut config: Config = toml::from_str(&contents).context(
+            "Failed to parse config.toml — check [channels_config.whatsapp] for syntax errors",
+        )?;
+        config.config_path = config_path;
+        config.workspace_dir = zeroclaw_dir.join("workspace");
+        Ok(config)
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn persist_allowed_phone_to_config(phone_e164: &str) -> anyhow::Result<()> {
+        let mut config = Self::load_config_without_env_whatsapp().await?;
+        let Some(wa) = config.channels_config.whatsapp.as_mut() else {
+            anyhow::bail!(
+                "Missing [channels_config.whatsapp] in config.toml. Configure WhatsApp Web first."
+            );
+        };
+
+        let normalized = Self::normalize_phone_token(phone_e164)
+            .filter(|s| !s.is_empty())
+            .context("Cannot persist invalid WhatsApp phone token")?;
+
+        let already = wa.allowed_numbers.iter().any(|existing| {
+            Self::normalize_phone_token(existing)
+                .as_ref()
+                .is_some_and(|n| n == &normalized)
+        });
+        if !already {
+            wa.allowed_numbers.push(normalized);
+            config
+                .save()
+                .await
+                .context("Failed to persist WhatsApp allowlist to config.toml")?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn add_allowed_phone_runtime(allowed: &Arc<RwLock<Vec<String>>>, phone_e164: &str) {
+        let Some(norm) = Self::normalize_phone_token(phone_e164) else {
+            return;
+        };
+        if let Ok(mut w) = allowed.write() {
+            let dup = w.iter().any(|existing| {
+                Self::normalize_phone_token(existing)
+                    .as_ref()
+                    .is_some_and(|n| n == &norm)
+            });
+            if !dup {
+                w.push(norm);
+            }
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_whatsapp_text_message(
+        client: &wa_rs::Client,
+        to: &wa_rs_binary::jid::Jid,
+        text: impl Into<String>,
+    ) {
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(text.into()),
+            ..Default::default()
+        };
+        if let Err(e) = client.send_message(to.clone(), outgoing).await {
+            tracing::warn!("WhatsApp Web: failed to send text reply: {e}");
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_whatsapp_unauthorized(
+        client: &wa_rs::Client,
+        chat: &wa_rs_binary::jid::Jid,
+        raw_text: &str,
+        sender_candidates: &[String],
+        pairing: Option<&PairingGuard>,
+        allowed_numbers: &Arc<RwLock<Vec<String>>>,
+    ) {
+        let client_id = sender_candidates
+            .first()
+            .map(String::as_str)
+            .unwrap_or("unknown");
+
+        if let Some(code) = Self::extract_bind_code(raw_text) {
+            if let Some(pairing) = pairing {
+                match pairing.try_pair(code, client_id).await {
+                    Ok(Some(_token)) => {
+                        let bind_phone = sender_candidates
+                            .iter()
+                            .find_map(|c| Self::normalize_phone_token(c));
+                        if let Some(phone) = bind_phone {
+                            Self::add_allowed_phone_runtime(allowed_numbers, &phone);
+                            match Self::persist_allowed_phone_to_config(&phone).await {
+                                Ok(()) => {
+                                    Self::send_whatsapp_text_message(
+                                        client,
+                                        chat,
+                                        "✅ WhatsApp number bound successfully. You can message ZeroClaw now.",
+                                    )
+                                    .await;
+                                    tracing::info!("WhatsApp Web: paired and allowlisted {phone}");
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "WhatsApp Web: failed to persist allowlist after bind: {e}"
+                                    );
+                                    Self::send_whatsapp_text_message(
+                                        client,
+                                        chat,
+                                        "⚠️ Bound for this session, but saving config failed. After restart you may need to bind again; check file permissions.",
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else {
+                            Self::send_whatsapp_text_message(
+                                client,
+                                chat,
+                                "❌ Could not read your phone number from this chat. Try again from a normal DM.",
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(None) => {
+                        Self::send_whatsapp_text_message(
+                            client,
+                            chat,
+                            "❌ Invalid binding code. Ask the operator for the current code and retry.",
+                        )
+                        .await;
+                    }
+                    Err(lockout_secs) => {
+                        Self::send_whatsapp_text_message(
+                            client,
+                            chat,
+                            format!("⏳ Too many invalid attempts. Retry in {lockout_secs}s."),
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                Self::send_whatsapp_text_message(
+                    client,
+                    chat,
+                    "ℹ️ WhatsApp pairing is not active. Ask the operator to add your number to channels_config.whatsapp.allowed_numbers or run `zeroclaw channel bind-whatsapp` with your E.164 number.",
+                )
+                .await;
+            }
+            return;
+        }
+
+        tracing::warn!(
+            "WhatsApp Web: ignoring message from sender not on allowlist (candidates={})",
+            sender_candidates.len()
+        );
+
+        let suggested = sender_candidates
+            .iter()
+            .find_map(|c| Self::normalize_phone_token(c))
+            .unwrap_or_else(|| "+YOUR_E164".to_string());
+
+        Self::send_whatsapp_text_message(
+            client,
+            chat,
+            format!(
+                "🔐 This number is not allowlisted.\n\nAsk the operator to run:\n`zeroclaw channel bind-whatsapp {suggested}`\n\nthen send your message again."
+            ),
+        )
+        .await;
+
+        if pairing.and_then(PairingGuard::pairing_code).is_some() {
+            Self::send_whatsapp_text_message(
+                client,
+                chat,
+                format!(
+                    "ℹ️ If the operator gave you a one-time code, send `{WHATSAPP_BIND_COMMAND} <code>` here."
+                ),
+            )
+            .await;
+        }
     }
 
     /// Check whether a phone number is allowed against a provided allowlist.
@@ -1076,7 +1359,8 @@ impl Channel for WhatsAppWebChannel {
 
             // Build the bot
             let tx_clone = tx.clone();
-            let allowed_numbers = self.allowed_numbers.clone();
+            let allowed_arc = Arc::clone(&self.allowed_numbers);
+            let wa_pairing = self.pairing.clone();
             let logout_tx_clone = logout_tx.clone();
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
@@ -1103,7 +1387,8 @@ impl Channel for WhatsAppWebChannel {
                 )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
-                    let allowed_numbers = allowed_numbers.clone();
+                    let allowed_arc = Arc::clone(&allowed_arc);
+                    let wa_pairing = wa_pairing.clone();
                     let logout_tx = logout_tx_clone.clone();
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
@@ -1136,12 +1421,19 @@ impl Channel for WhatsAppWebChannel {
                                     mapped_phone.as_deref(),
                                 );
 
-                                let normalized = sender_candidates
-                                    .iter()
-                                    .find(|candidate| {
-                                        Self::is_number_allowed_for_list(&allowed_numbers, candidate)
-                                    })
-                                    .cloned();
+                                let (wildcard, normalized_match) = {
+                                    let Ok(snapshot) = allowed_arc.read() else {
+                                        return;
+                                    };
+                                    let wildcard = snapshot.iter().any(|e| e.trim() == "*");
+                                    let normalized_match = sender_candidates
+                                        .iter()
+                                        .find(|candidate| {
+                                            Self::is_number_allowed_for_list(&snapshot, candidate)
+                                        })
+                                        .cloned();
+                                    (wildcard, normalized_match)
+                                };
 
                                 let is_group = info.source.is_group;
 
@@ -1176,9 +1468,13 @@ impl Channel for WhatsAppWebChannel {
                                         // won't be delivered. Convert to a phone
                                         // JID so the reply shows up in the self-chat.
                                         if info.source.chat.is_lid() {
-                                            let phone_digits = normalized
+                                            let phone_digits = normalized_match
                                                 .as_ref()
-                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                                                .map(|n| {
+                                                    n.chars()
+                                                        .filter(|c| c.is_ascii_digit())
+                                                        .collect::<String>()
+                                                })
                                                 .filter(|d| !d.is_empty());
                                             if let Some(digits) = phone_digits {
                                                 reply_target = format!("{digits}@s.whatsapp.net");
@@ -1199,11 +1495,21 @@ impl Channel for WhatsAppWebChannel {
                                                 // allow unconditionally
                                             }
                                             crate::config::WhatsAppChatPolicy::Allowlist => {
-                                                if normalized.is_none() {
+                                                if normalized_match.is_none() {
                                                     tracing::warn!(
                                                         "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
                                                         sender_candidates.len()
                                                     );
+                                                    let raw_text = msg.text_content().unwrap_or("").trim().to_string();
+                                                    Self::handle_whatsapp_unauthorized(
+                                                        &client,
+                                                        &info.source.chat,
+                                                        &raw_text,
+                                                        &sender_candidates,
+                                                        wa_pairing.as_ref(),
+                                                        &allowed_arc,
+                                                    )
+                                                    .await;
                                                     return;
                                                 }
                                             }
@@ -1221,11 +1527,21 @@ impl Channel for WhatsAppWebChannel {
                                                 // allow unconditionally
                                             }
                                             crate::config::WhatsAppChatPolicy::Allowlist => {
-                                                if normalized.is_none() {
+                                                if normalized_match.is_none() {
                                                     tracing::warn!(
                                                         "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
                                                         sender_candidates.len()
                                                     );
+                                                    let raw_text = msg.text_content().unwrap_or("").trim().to_string();
+                                                    Self::handle_whatsapp_unauthorized(
+                                                        &client,
+                                                        &info.source.chat,
+                                                        &raw_text,
+                                                        &sender_candidates,
+                                                        wa_pairing.as_ref(),
+                                                        &allowed_arc,
+                                                    )
+                                                    .await;
                                                     return;
                                                 }
                                             }
@@ -1233,7 +1549,24 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
 
-                                let normalized = normalized.unwrap_or_else(|| sender.clone());
+                                if wa_mode == crate::config::WhatsAppWebMode::Business {
+                                    if !wildcard && normalized_match.is_none() {
+                                        let raw_text =
+                                            msg.text_content().unwrap_or("").trim().to_string();
+                                        Self::handle_whatsapp_unauthorized(
+                                            &client,
+                                            &info.source.chat,
+                                            &raw_text,
+                                            &sender_candidates,
+                                            wa_pairing.as_ref(),
+                                            &allowed_arc,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+
+                                let normalized = normalized_match.unwrap_or_else(|| sender.clone());
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note).
                                 // When `transcribe_non_ptt_audio` is enabled in the transcription
@@ -1754,8 +2087,47 @@ mod tests {
             crate::config::WhatsAppChatPolicy::default(),
             false,
         );
-        // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
+        // Empty allowlist denies until `/bind` adds a number at runtime.
         assert!(!ch.is_number_allowed("+1234567890"));
+        assert!(ch.pairing_code_active());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_pairing_disabled_when_wildcard_or_nonempty() {
+        let with_star = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["*".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
+        assert!(!with_star.pairing_code_active());
+
+        let with_num = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["+15550001111".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
+        assert!(!with_num.pairing_code_active());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_extract_bind_code() {
+        assert_eq!(
+            WhatsAppWebChannel::extract_bind_code("/bind abc123"),
+            Some("abc123")
+        );
+        assert!(WhatsAppWebChannel::extract_bind_code("hello").is_none());
     }
 
     #[test]

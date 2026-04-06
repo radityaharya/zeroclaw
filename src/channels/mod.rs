@@ -445,15 +445,58 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+/// WhatsApp 1:1 DM: key sessions on `reply_target` + E.164 from the chat JID user part.
+/// `msg.sender` can differ from PN/LID candidate lists (e.g. +628…2002 vs +628…286) and must
+/// not split history from `/external-webhook` (see `whatsapp_dm_history_key_from_recipient`).
+fn is_whatsapp_group_reply_target(reply_target: &str) -> bool {
+    reply_target.trim().contains("@g.us")
+}
+
+fn whatsapp_dm_history_key_from_reply_target(reply_target: &str) -> Option<String> {
+    let rt = reply_target.trim();
+    if rt.contains("@g.us") {
+        return None;
+    }
+    if !rt.ends_with("@s.whatsapp.net") {
+        return None;
+    }
+    let user = rt.strip_suffix("@s.whatsapp.net")?;
+    let digits: String = user.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let e164 = format!("+{digits}");
+    Some(format!("whatsapp_{}_{}", rt, e164))
+}
+
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
+    //
+    // WhatsApp group chats (`…@g.us`): one shared transcript + memory scope for all
+    // members (reply_target only; no per-sender suffix).
+    let wa_group = msg.channel == "whatsapp" && is_whatsapp_group_reply_target(&msg.reply_target);
+    let reply_target = msg.reply_target.trim();
+
     match &msg.thread_ts {
-        Some(tid) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(tid) => {
+            if wa_group {
+                format!("{}_{}_{}", msg.channel, reply_target, tid)
+            } else {
+                format!("{}_{}_{}_{}", msg.channel, reply_target, tid, msg.sender)
+            }
+        }
+        None => {
+            if msg.channel == "whatsapp" {
+                if let Some(key) = whatsapp_dm_history_key_from_reply_target(reply_target) {
+                    return key;
+                }
+                if is_whatsapp_group_reply_target(reply_target) {
+                    return format!("{}_{}", msg.channel, reply_target);
+                }
+            }
+            format!("{}_{}_{}", msg.channel, reply_target, msg.sender)
+        }
     }
 }
 
@@ -462,12 +505,23 @@ fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
+    let wa_group = msg.channel == "whatsapp" && is_whatsapp_group_reply_target(&msg.reply_target);
+    let reply_target = msg.reply_target.trim();
     match &msg.interruption_scope_id {
-        Some(scope) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(scope) => {
+            if wa_group {
+                format!("{}_{}_{}", msg.channel, reply_target, scope)
+            } else {
+                format!("{}_{}_{}_{}", msg.channel, reply_target, msg.sender, scope)
+            }
+        }
+        None => {
+            if wa_group {
+                format!("{}_{}", msg.channel, reply_target)
+            } else {
+                format!("{}_{}_{}", msg.channel, reply_target, msg.sender)
+            }
+        }
     }
 }
 
@@ -2687,20 +2741,34 @@ async fn process_channel_message(
 
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
-    // For group chats: merge sender-scope + group-scope memories.
-    // For DMs: sender-scope only.
-    let is_group_chat =
-        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+    // WhatsApp groups: one shared `history_key` for the whole chat — single recall.
+    // Other group chats (`group:`): merge sender-scope + thread-scope memories.
+    // DMs: session-scoped recall only.
+    let is_whatsapp_group = msg.channel == "whatsapp" && msg.reply_target.contains("@g.us");
+    let is_other_group_chat = !is_whatsapp_group && msg.reply_target.starts_with("group:");
 
     let mem_recall_start = Instant::now();
     let sender_memory_fut = build_memory_context(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
-        Some(&msg.sender),
+        if is_other_group_chat {
+            Some(&msg.sender)
+        } else {
+            Some(&history_key)
+        },
     );
 
-    let (sender_memory, group_memory) = if is_group_chat {
+    let (sender_memory, group_memory) = if is_whatsapp_group {
+        let group_only = build_memory_context(
+            ctx.memory.as_ref(),
+            &msg.content,
+            ctx.min_relevance_score,
+            Some(&history_key),
+        )
+        .await;
+        (String::new(), group_only)
+    } else if is_other_group_chat {
         let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
@@ -4098,6 +4166,70 @@ fn normalize_telegram_identity(value: &str) -> String {
     value.trim().trim_start_matches('@').to_string()
 }
 
+fn normalize_whatsapp_e164_for_bind(phone: &str) -> Option<String> {
+    let trimmed = phone.trim();
+    let user_part = trimmed
+        .split_once('@')
+        .map(|(u, _)| u)
+        .unwrap_or(trimmed)
+        .trim();
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    Some(format!("+{digits}"))
+}
+
+async fn bind_whatsapp_phone(config: &Config, phone: &str) -> Result<()> {
+    let normalized = normalize_whatsapp_e164_for_bind(phone)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Invalid phone: use E.164 like +15551234567"))?;
+
+    let mut updated = config.clone();
+    let Some(wa) = updated.channels_config.whatsapp.as_mut() else {
+        anyhow::bail!(
+            "WhatsApp channel is not configured. Set session_path (Web) or phone_number_id (Cloud) first."
+        );
+    };
+
+    if wa.allowed_numbers.iter().any(|e| e.trim() == "*") {
+        println!(
+            "⚠️ WhatsApp allowlist is wildcard (`*`) — binding is unnecessary until you remove '*'."
+        );
+    }
+
+    let already = wa
+        .allowed_numbers
+        .iter()
+        .any(|existing| normalize_whatsapp_e164_for_bind(existing).as_ref() == Some(&normalized));
+    if already {
+        println!("✅ WhatsApp number already bound: {normalized}");
+        return Ok(());
+    }
+
+    wa.allowed_numbers.push(normalized.clone());
+    updated.save().await?;
+    println!("✅ Bound WhatsApp number: {normalized}");
+    println!("   Saved to {}", updated.config_path.display());
+    match maybe_restart_managed_daemon_service() {
+        Ok(true) => {
+            println!("🔄 Detected running managed daemon service; reloaded automatically.");
+        }
+        Ok(false) => {
+            println!(
+                "ℹ️ No managed daemon service detected. If `zeroclaw daemon` is running, restart it to load the updated allowlist."
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️ Allowlist saved, but failed to reload daemon service automatically: {e}\n\
+                 Restart manually with `zeroclaw service stop && zeroclaw service start`."
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<()> {
     let normalized = normalize_telegram_identity(identity);
     if normalized.is_empty() {
@@ -4298,6 +4430,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
         crate::ChannelCommands::BindTelegram { identity } => {
             Box::pin(bind_telegram_identity(config, &identity)).await
         }
+        crate::ChannelCommands::BindWhatsapp { phone } => {
+            Box::pin(bind_whatsapp_phone(config, &phone)).await
+        }
         crate::ChannelCommands::Send {
             message,
             channel_id,
@@ -4473,19 +4608,99 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
     }
 }
 
-/// Send a one-off message to a configured channel.
-async fn send_channel_message(
+/// Normalize a phone-like recipient to E.164 `+<digits>` for memory session scoping.
+/// Matches WhatsApp channel `sender` normalization so `process_message` recall aligns with DMs.
+pub fn normalize_whatsapp_recipient_e164(recipient: &str) -> String {
+    let trimmed = recipient.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let user_part = trimmed
+        .split_once('@')
+        .map(|(user, _)| user)
+        .unwrap_or(trimmed)
+        .trim();
+    let digits: String = user_part.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        trimmed.to_string()
+    } else {
+        format!("+{digits}")
+    }
+}
+
+/// WhatsApp memory / history scope aligned with [`conversation_history_key`]:
+/// - **1:1 DMs:** `whatsapp_{chat JID}_{+digits}` — inbound DMs derive from `reply_target`, not
+///   `sender`, so PN/LID variants do not split sessions from external webhook.
+/// - **Groups (`…@g.us`):** `whatsapp_{group JID}` — one shared scope for all members.
+///
+/// Autosave and sqlite recall use this as `session_id`; external webhook should use the same.
+pub fn whatsapp_dm_history_key_from_recipient(recipient: &str) -> String {
+    let trimmed = recipient.trim();
+    if trimmed.contains("@g.us") {
+        return format!("whatsapp_{trimmed}");
+    }
+    let sender = normalize_whatsapp_recipient_e164(trimmed);
+    let reply_target = if trimmed.contains('@') {
+        trimmed.to_string()
+    } else {
+        let digits: String = trimmed.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return format!("whatsapp_unknown_{sender}");
+        }
+        format!("{digits}@s.whatsapp.net")
+    };
+    format!("whatsapp_{}_{}", reply_target, sender)
+}
+
+/// Send a one-off message to a configured channel (e.g. Telegram, Discord, Slack, WhatsApp).
+pub async fn send_message_to_channel(
     config: &Config,
     channel_id: &str,
     recipient: &str,
     message: &str,
 ) -> Result<()> {
+    if channel_id == "whatsapp" {
+        if let Some(ref wa) = config.channels_config.whatsapp {
+            if wa.backend_type() == "web" && wa.is_web_config() {
+                #[cfg(feature = "whatsapp-web")]
+                {
+                    if let Some(ch) = whatsapp_web::outbound_whatsapp_web_for_config(config) {
+                        let msg = SendMessage::new(message, recipient);
+                        return ch
+                            .send(&msg)
+                            .await
+                            .with_context(|| format!("Failed to send message via {channel_id}"));
+                    }
+                    anyhow::bail!(
+                        "WhatsApp Web is not active in this process. Run `zeroclaw daemon` \
+                         (or `zeroclaw channel start` in the same process as the gateway) so the \
+                         WhatsApp session connects, then retry. Gateway-only mode cannot send via Web."
+                    );
+                }
+                #[cfg(not(feature = "whatsapp-web"))]
+                {
+                    anyhow::bail!("WhatsApp Web requires building with --features whatsapp-web");
+                }
+            }
+        }
+    }
+
     let channel = build_channel_by_id(config, channel_id)?;
     let msg = SendMessage::new(message, recipient);
     channel
         .send(&msg)
         .await
         .with_context(|| format!("Failed to send message via {channel_id}"))?;
+    Ok(())
+}
+
+async fn send_channel_message(
+    config: &Config,
+    channel_id: &str,
+    recipient: &str,
+    message: &str,
+) -> Result<()> {
+    send_message_to_channel(config, channel_id, recipient, message).await?;
     println!("Message sent via {channel_id}.");
     Ok(())
 }
@@ -4515,8 +4730,11 @@ struct ConfiguredChannel {
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
+    register_whatsapp_web_outbound: bool,
 ) -> Vec<ConfiguredChannel> {
     let _ = matrix_skip_context;
+    #[cfg(not(feature = "whatsapp-web"))]
+    let _ = register_whatsapp_web_outbound;
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -4723,25 +4941,32 @@ fn collect_configured_channels(
                 // Web mode: requires session_path
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
+                    let wa_ch = Arc::new(
+                        WhatsAppWebChannel::new(
+                            wa.session_path.clone().unwrap_or_default(),
+                            wa.pair_phone.clone(),
+                            wa.pair_code.clone(),
+                            wa.allowed_numbers.clone(),
+                            wa.mention_only,
+                            wa.mode.clone(),
+                            wa.dm_policy.clone(),
+                            wa.group_policy.clone(),
+                            wa.self_chat_mode,
+                        )
+                        .with_transcription(config.transcription.clone())
+                        .with_tts(config.tts.clone())
+                        .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                        .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                    );
+                    if register_whatsapp_web_outbound {
+                        let key =
+                            shellexpand::tilde(wa.session_path.as_deref().unwrap_or_default())
+                                .to_string();
+                        whatsapp_web::register_whatsapp_web_for_outbound(key, Arc::clone(&wa_ch));
+                    }
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
-                        channel: Arc::new(
-                            WhatsAppWebChannel::new(
-                                wa.session_path.clone().unwrap_or_default(),
-                                wa.pair_phone.clone(),
-                                wa.pair_code.clone(),
-                                wa.allowed_numbers.clone(),
-                                wa.mention_only,
-                                wa.mode.clone(),
-                                wa.dm_policy.clone(),
-                                wa.group_policy.clone(),
-                                wa.self_chat_mode,
-                            )
-                            .with_transcription(config.transcription.clone())
-                            .with_tts(config.tts.clone())
-                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                            .with_group_mention_patterns(wa.group_mention_patterns.clone()),
-                        ),
+                        channel: wa_ch,
                     });
                 } else {
                     tracing::warn!("WhatsApp Web configured but session_path not set");
@@ -5037,7 +5262,7 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check", false);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
@@ -5097,6 +5322,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config) -> Result<()> {
+    #[cfg(feature = "whatsapp-web")]
+    whatsapp_web::clear_whatsapp_web_outbound_registry();
+
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Arc<dyn Provider> = Arc::from(
@@ -5382,7 +5610,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup", true)
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -9276,6 +9504,79 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn whatsapp_dm_history_key_matches_conversation_history_key() {
+        let msg = traits::ChannelMessage {
+            id: "m1".into(),
+            sender: "+15551234567".into(),
+            reply_target: "15551234567@s.whatsapp.net".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("+1 555 123 4567")
+        );
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("15551234567@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn whatsapp_dm_history_key_uses_chat_jid_when_sender_candidate_differs() {
+        let msg = traits::ChannelMessage {
+            id: "m1".into(),
+            sender: "+628121922200286".into(),
+            reply_target: "6281219222002@s.whatsapp.net".into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        assert_eq!(
+            conversation_history_key(&msg),
+            whatsapp_dm_history_key_from_recipient("+6281219222002")
+        );
+    }
+
+    #[test]
+    fn whatsapp_group_shared_conversation_history_key() {
+        let group_jid = "120363401878857104@g.us";
+        let msg_a = traits::ChannelMessage {
+            id: "a".into(),
+            sender: "+1111111111".into(),
+            reply_target: group_jid.into(),
+            content: "hi".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let msg_b = traits::ChannelMessage {
+            id: "b".into(),
+            sender: "+2222222222".into(),
+            reply_target: group_jid.into(),
+            content: "yo".into(),
+            channel: "whatsapp".into(),
+            timestamp: 2,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+        let expected = format!("whatsapp_{group_jid}");
+        assert_eq!(conversation_history_key(&msg_a), expected);
+        assert_eq!(conversation_history_key(&msg_b), expected);
+        assert_eq!(whatsapp_dm_history_key_from_recipient(group_jid), expected);
+    }
+
+    #[test]
     fn followup_thread_id_prefers_thread_ts() {
         let msg = traits::ChannelMessage {
             id: "slack_C123_1741234567.123456".into(),
@@ -10274,7 +10575,7 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test", false);
 
         assert!(
             channels

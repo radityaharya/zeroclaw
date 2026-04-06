@@ -224,6 +224,21 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Bind a WhatsApp phone number (E.164) into the Web/Cloud allowlist
+    #[command(
+        name = "bind-whatsapp",
+        long_about = "\
+Add a phone number to channels_config.whatsapp.allowed_numbers so the agent \
+accepts messages from that sender (WhatsApp Web or Cloud API).
+
+Examples:
+  zeroclaw channel bind-whatsapp +15551234567
+  zeroclaw channel bind-whatsapp +6281219222002"
+    )]
+    BindWhatsapp {
+        /// Phone in E.164 form (digits with leading +)
+        phone: String,
+    },
     /// Send a message to a configured channel
     #[command(long_about = "\
 Send a one-off message to a configured channel.

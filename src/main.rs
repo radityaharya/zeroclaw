@@ -405,6 +405,7 @@ Examples:
   zeroclaw channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
   zeroclaw channel remove my-bot
   zeroclaw channel bind-telegram zeroclaw_user
+  zeroclaw channel bind-whatsapp +15551234567
   zeroclaw channel send 'Alert!' --channel-id telegram --recipient 123456789")]
     Channel {
         #[command(subcommand)]
